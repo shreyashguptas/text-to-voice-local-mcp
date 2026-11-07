@@ -84,18 +84,29 @@ else
 fi
 DESKTOP="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 if [ -d "$(dirname "$DESKTOP")" ]; then
+    # A running Claude Desktop rewrites this file from memory and drops the
+    # new entry, so it has to be closed while the file is edited.
+    while pgrep -x Claude >/dev/null 2>&1; do
+        if [ -t 0 ]; then
+            printf '    Claude Desktop is open and would undo this change. Quit it (Cmd+Q), then press Enter. '
+            read -r _
+        else
+            bad "Claude Desktop is open; quit it and run make install again to connect it."
+            break
+        fi
+    done
     /usr/bin/python3 - "$DESKTOP" "$NAME" "$BIN" <<'EOF'
 import json, os, sys
 path, name, binary = sys.argv[1:]
 config = json.load(open(path)) if os.path.exists(path) else {}
-config.setdefault("mcpServers", {})[name] = {"command": binary, "args": []}
+config.setdefault("mcpServers", {})[name] = {"command": binary}
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(config, f, indent=2)
     f.write("\n")
 os.replace(tmp, path)
 EOF
-    ok "Claude Desktop: \"$NAME\" (restart Claude Desktop once to load it)"
+    ok "Claude Desktop: \"$NAME\" (open Claude Desktop again to load it)"
 else
     bad "Claude Desktop not found; skipped."
 fi
