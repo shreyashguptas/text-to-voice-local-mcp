@@ -17,18 +17,28 @@ leaves the machine.
 
 ## Install
 
-Needs Rust ([rustup.rs](https://rustup.rs)).
-
 ```sh
 git clone https://github.com/shreyashguptas/text-to-voice-local-mcp.git
 cd text-to-voice-local-mcp
-./install.sh
+make install
 ```
 
-`install.sh` builds the binary and registers it as an MCP server called
-`text-to-voice` with Claude Code (user scope) and Claude Desktop. Restart
-Claude Desktop afterwards. For any other MCP app, point it at the binary with
-no arguments:
+`make install` checks for everything it needs (Xcode Command Line Tools,
+Homebrew, CMake, Rust) and, if something is missing, shows the command that
+fixes it and offers to run it. It then builds, registers the MCP server as
+`text-to-voice` with Claude Code (every project) and Claude Desktop, starts it,
+and says a test line. If no neural voice model is on the Mac it offers to
+download Kokoro v1.0 (355 MB). Restart Claude Desktop once afterwards.
+
+| Command | Does |
+|---|---|
+| `make install` | check, build, connect, start |
+| `make update` | `git pull`, then install (the running copy restarts on the new build) |
+| `make uninstall` | disconnect from both apps and stop |
+| `make status` | who is using the voice, which model is loaded, memory |
+| `make test` | run the tests |
+
+For any other MCP app, point it at the binary with no arguments:
 
 ```json
 { "mcpServers": { "text-to-voice": { "command": "/path/to/target/release/text-to-voice-local-mcp" } } }
