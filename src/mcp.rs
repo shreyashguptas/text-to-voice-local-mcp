@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const INSTRUCTIONS: &str = "\
 Local text-to-speech on this Mac. Everything runs on the machine; nothing is sent anywhere.
@@ -263,9 +263,10 @@ impl TtsServer {
             let (model, voice) = (choice.model.info().id.clone(), choice.voice.id.clone());
             let speaking =
                 speech::start(reg, choice, args.text, args.speed.unwrap_or(1.0), args.volume.unwrap_or(1.0), guard);
-            speaking.started().map_err(|e| format!("{e:#}"))?;
+            let playing = speaking.started().map_err(|e| format!("{e:#}"))?;
             if !args.wait {
-                return Ok(SpeakOut { status: "playing".into(), model, voice, duration_seconds: None });
+                let status = if playing { "playing" } else { "stopped" };
+                return Ok(SpeakOut { status: status.into(), model, voice, duration_seconds: None });
             }
             let done = speaking.finish().map_err(|e| format!("{e:#}"))?;
             Ok(SpeakOut {
@@ -291,8 +292,8 @@ impl TtsServer {
         let client = client_name(&peer);
         let return_audio = args.return_audio;
         let out = tokio::task::spawn_blocking(move || {
-            let _guard = shared.voice.try_take(&client, "making a file of", &args.text).map_err(|b| b.message())?;
-            synthesize_to_file(&shared.registry, args)
+            let guard = shared.voice.try_take(&client, "making a file of", &args.text).map_err(|b| b.message())?;
+            synthesize_to_file(&shared.registry, args, &guard.cancel)
         })
         .await
         .map_err(err)??;
@@ -360,18 +361,26 @@ pub fn voices_matching(reg: &Registry, args: &ListVoicesArgs) -> Result<Vec<Voic
         .collect())
 }
 
-pub fn synthesize_to_file(reg: &Registry, args: SynthesizeArgs) -> Result<SynthesizeOut, String> {
+pub fn synthesize_to_file(reg: &Registry, args: SynthesizeArgs, cancel: &AtomicBool) -> Result<SynthesizeOut, String> {
     let choice = reg.choose(args.model.as_deref(), args.voice.as_deref(), args.language.as_deref()).map_err(err)?;
-    let requested = args.output_path.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(expand_home);
+    let raw = args.output_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let requested = raw.map(expand_home);
     let format = args
         .format
         .or_else(|| requested.as_deref().and_then(Format::from_path))
         .unwrap_or(Format::Wav);
     let path = match requested {
         Some(p) if p.is_dir() => p.join(default_name(format)),
-        Some(p) if p.is_absolute() => {
-            if Format::from_path(&p).is_none() { p.with_extension(format.extension()) } else { p }
+        Some(p) if raw.is_some_and(|r| r.ends_with('/')) => {
+            return Err(format!("the folder {} does not exist", p.display()));
         }
+        Some(p) if p.is_absolute() => match Format::from_path(&p) {
+            Some(f) if f == format => p,
+            // `x.wav` with format m4a: the name follows the content.
+            Some(_) => p.with_extension(format.extension()),
+            // `take.v2`: keep the whole name and add the extension.
+            None => PathBuf::from(format!("{}.{}", p.display(), format.extension())),
+        },
         Some(p) => return Err(format!("output_path must be absolute, got `{}`", p.display())),
         None => audio::scratch_dir().map_err(err)?.join(default_name(format)),
     };
@@ -379,9 +388,12 @@ pub fn synthesize_to_file(reg: &Registry, args: SynthesizeArgs) -> Result<Synthe
     let stats = reg
         .synthesize(&choice, &args.text, args.speed.unwrap_or(1.0), |piece| {
             samples.extend_from_slice(&piece);
-            true
+            !cancel.load(Ordering::Relaxed)
         })
         .map_err(|e| format!("{e:#}"))?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("stopped before the file was finished; nothing was saved".into());
+    }
     let bytes = audio::save(&samples, stats.sample_rate, format, &path).map_err(|e| format!("{e:#}"))?;
     Ok(SynthesizeOut {
         path: path.display().to_string(),

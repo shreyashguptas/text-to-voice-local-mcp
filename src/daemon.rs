@@ -33,9 +33,11 @@ fn paths() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     Ok((d.join("daemon.sock"), d.join("daemon.lock"), d.join("daemon.json"), d.join("daemon.log")))
 }
 
-/// Identifies this exact binary, so a rebuilt one can replace an old daemon.
-fn build_id() -> String {
-    let exe = std::env::current_exe().ok();
+/// This binary's identity: version, size and modification time of the real
+/// file. The path is left out (symlinks and `/tmp` vs `/private/tmp` spell
+/// one file many ways), so only a rebuilt binary counts as different.
+fn build() -> (String, u64) {
+    let exe = std::env::current_exe().ok().and_then(|e| std::fs::canonicalize(e).ok());
     let meta = exe.as_ref().and_then(|e| std::fs::metadata(e).ok());
     let mtime = meta
         .as_ref()
@@ -43,13 +45,20 @@ fn build_id() -> String {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!(
-        "{}:{}:{}:{}",
-        env!("CARGO_PKG_VERSION"),
-        exe.map(|e| e.display().to_string()).unwrap_or_default(),
-        meta.map(|m| m.len()).unwrap_or(0),
-        mtime
-    )
+    (format!("{}:{}:{mtime}", env!("CARGO_PKG_VERSION"), meta.map(|m| m.len()).unwrap_or(0)), mtime)
+}
+
+/// Is `pid` a running daemon of this tool (and not some process that reused
+/// a stale pid)?
+fn is_our_daemon(pid: u64) -> bool {
+    Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| {
+            let cmd = String::from_utf8_lossy(&o.stdout);
+            cmd.contains("text-to-voice-local-mcp") && cmd.trim_end().ends_with(" daemon")
+        })
+        .unwrap_or(false)
 }
 
 fn secs(var: &str, default: u64) -> Duration {
@@ -69,7 +78,7 @@ pub async fn run_daemon() -> Result<()> {
     let listener = tokio::net::UnixListener::bind(&sock).with_context(|| format!("could not listen on {}", sock.display()))?;
     std::fs::write(
         &info_path,
-        serde_json::to_vec(&json!({ "pid": std::process::id(), "build": build_id() }))?,
+        serde_json::to_vec(&json!({ "pid": std::process::id(), "build": build().0, "mtime": build().1 }))?,
     )?;
     eprintln!("daemon {} listening on {}", std::process::id(), sock.display());
 
@@ -135,15 +144,17 @@ fn wait_for_lock_free(lock_path: &std::path::Path) {
 pub fn connect() -> Result<UnixStream> {
     let (sock, lock_path, info_path, log_path) = paths()?;
     let running: Option<Value> = std::fs::read(&info_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let (my_build, my_mtime) = build();
     if let Some(info) = &running {
-        if info["build"].as_str() == Some(build_id().as_str()) {
-            if let Ok(s) = UnixStream::connect(&sock) {
-                return Ok(s);
-            }
-        } else if let Some(pid) = info["pid"].as_u64() {
-            // An older build is running. Ask it to quit so this one takes over.
+        let pid = info["pid"].as_u64().unwrap_or(0);
+        let newer_than_running = my_mtime > info["mtime"].as_u64().unwrap_or(0);
+        if info["build"].as_str() != Some(my_build.as_str()) && newer_than_running && is_our_daemon(pid) {
+            // An older build is running: ask it to quit so this one takes over.
+            // (An older binary never replaces a newer daemon; it just uses it.)
             let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
             wait_for_lock_free(&lock_path);
+        } else if let Ok(s) = UnixStream::connect(&sock) {
+            return Ok(s);
         }
     } else if let Ok(s) = UnixStream::connect(&sock) {
         return Ok(s);
@@ -178,20 +189,47 @@ pub fn connect() -> Result<UnixStream> {
 /// app's `initialize` request and `initialized` notification, so when the
 /// daemon has exited (it does when idle) it can start a new one and replay
 /// the handshake before passing on the next message.
+///
+/// It also remembers which requests are still waiting for an answer. If the
+/// daemon goes away before answering (a restart for a new build, a crash),
+/// each of them gets an error reply instead of hanging, and the relay keeps
+/// running: the next request reconnects.
 pub fn relay() -> Result<()> {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+    type Out = Arc<Mutex<std::io::Stdout>>;
+    /// Request id -> the connection (generation) it was sent on.
+    type Pending = Arc<Mutex<HashMap<String, u64>>>;
+
+    let stdout: Out = Arc::new(Mutex::new(std::io::stdout()));
+    let pending: Pending = Arc::default();
     let mut conn: Option<UnixStream> = None;
+    let mut reader: Option<std::thread::JoinHandle<()>> = None;
+    let mut generation: u64 = 0;
     let mut init: Option<(String, Value)> = None; // (line, id)
     let mut initialized: Option<String> = None;
-    let mut reader_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
-    let open = |init: &Option<(String, Value)>, initialized: &Option<String>| -> Result<UnixStream> {
+    fn write_line(out: &Out, line: &str) {
+        let mut o = out.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(o, "{}", line.trim_end());
+        let _ = o.flush();
+    }
+    fn error_reply(out: &Out, id: &Value, why: &str) {
+        let msg = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": why } });
+        write_line(out, &msg.to_string());
+    }
+
+    // Connect, replay the handshake (swallowing the reply the app already
+    // has) and start a thread that copies the daemon's replies to stdout.
+    let open = |generation: u64,
+                replay_init: Option<&(String, Value)>,
+                replay_initialized: Option<&String>|
+     -> Result<(UnixStream, std::thread::JoinHandle<()>)> {
         let mut stream = connect()?;
-        if let Some((line, id)) = init {
-            // Replay the handshake and swallow the reply the app already has.
+        let mut r = BufReader::new(stream.try_clone()?);
+        if let Some((line, id)) = replay_init {
+            stream.set_read_timeout(Some(Duration::from_secs(15)))?;
             writeln!(stream, "{line}")?;
-            let mut r = BufReader::new(stream.try_clone()?);
             let mut reply = String::new();
             loop {
                 reply.clear();
@@ -202,11 +240,39 @@ pub fn relay() -> Result<()> {
                     break;
                 }
             }
-            if let Some(n) = initialized {
+            stream.set_read_timeout(None)?;
+            if let Some(n) = replay_initialized {
                 writeln!(stream, "{n}")?;
             }
         }
-        Ok(stream)
+        let (out, pending) = (stdout.clone(), pending.clone());
+        let thread = std::thread::spawn(move || {
+            let mut buf = String::new();
+            while matches!(r.read_line(&mut buf), Ok(n) if n > 0) {
+                if let Ok(v) = serde_json::from_str::<Value>(buf.trim()) {
+                    if v.get("result").is_some() || v.get("error").is_some() {
+                        pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&v["id"].to_string());
+                    }
+                }
+                write_line(&out, &buf);
+                buf.clear();
+            }
+            // The daemon went away. Answer whatever it left unanswered on
+            // this connection.
+            let left: Vec<String> = {
+                let mut p = pending.lock().unwrap_or_else(|e| e.into_inner());
+                let ids: Vec<String> = p.iter().filter(|(_, g)| **g == generation).map(|(id, _)| id.clone()).collect();
+                ids.iter().for_each(|id| {
+                    p.remove(id);
+                });
+                ids
+            };
+            for id in left {
+                let id: Value = serde_json::from_str(&id).unwrap_or(Value::Null);
+                error_reply(&out, &id, "The voice server restarted before answering. Please try again.");
+            }
+        });
+        Ok((stream, thread))
     };
 
     let stdin = std::io::stdin();
@@ -217,40 +283,52 @@ pub fn relay() -> Result<()> {
         }
         let msg: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         let is_init = msg["method"] == "initialize";
-        if msg["method"] == "notifications/initialized" {
+        let is_initialized = msg["method"] == "notifications/initialized";
+        let is_request = msg.get("method").is_some() && msg.get("id").is_some();
+        if is_initialized {
             initialized = Some(line.clone());
         }
-        // A daemon that exited while we waited: reconnect.
-        if reader_threads.last().is_some_and(|t| t.is_finished()) {
-            conn = None;
+        if reader.as_ref().is_some_and(|t| t.is_finished()) {
+            conn = None; // the daemon exited while we waited
         }
-        for attempt in 0..2 {
+        let id_key = msg["id"].to_string();
+
+        let mut sent = false;
+        for _attempt in 0..2 {
             if conn.is_none() {
-                // A fresh connection: the handshake is replayed unless this
-                // line is the handshake itself.
-                let replay = if is_init { None } else { init.clone() };
-                let stream = open(&replay, &initialized)?;
-                let out = stdout.clone();
-                let mut r = BufReader::new(stream.try_clone()?);
-                reader_threads.push(std::thread::spawn(move || {
-                    let mut buf = String::new();
-                    while matches!(r.read_line(&mut buf), Ok(n) if n > 0) {
-                        let mut o = out.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = o.write_all(buf.as_bytes());
-                        let _ = o.flush();
-                        buf.clear();
+                // Replay the handshake unless this line is part of it.
+                let replay_init = if is_init { None } else { init.as_ref() };
+                let replay_initialized = if is_initialized { None } else { initialized.as_ref() };
+                generation += 1;
+                match open(generation, replay_init, replay_initialized) {
+                    Ok((s, t)) => {
+                        conn = Some(s);
+                        reader = Some(t);
                     }
-                }));
-                conn = Some(stream);
+                    Err(e) => {
+                        eprintln!("text-to-voice relay: {e:#}");
+                        continue;
+                    }
+                }
+            }
+            if is_request {
+                pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id_key.clone(), generation);
             }
             let stream = conn.as_mut().expect("connected");
             if writeln!(stream, "{line}").and_then(|_| stream.flush()).is_ok() {
+                sent = true;
                 break;
             }
-            conn = None; // the daemon went away; reconnect once
-            if attempt == 1 {
-                bail!("could not reach the voice server");
+            // The daemon went away. Take the request back before its reader
+            // answers it with an error; if that already happened, stop here.
+            conn = None;
+            if is_request && pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id_key).is_none() {
+                sent = true;
+                break;
             }
+        }
+        if !sent && is_request {
+            error_reply(&stdout, &msg["id"], "Could not reach the local voice server. Please try again.");
         }
         if is_init {
             init = Some((line.clone(), msg["id"].clone()));
@@ -260,8 +338,8 @@ pub fn relay() -> Result<()> {
     if let Some(s) = &conn {
         let _ = s.shutdown(std::net::Shutdown::Write);
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    for t in reader_threads {
+    if let Some(t) = reader {
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !t.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }

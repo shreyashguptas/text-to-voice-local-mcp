@@ -180,7 +180,13 @@ pub enum PlayOutcome {
 
 /// Play chunks of mono audio as they arrive on `chunks`, gaplessly. Blocks
 /// until everything is played or `cancel` is set.
-pub fn play_stream(chunks: Receiver<Vec<f32>>, sample_rate: u32, volume: f32, cancel: Arc<AtomicBool>) -> Result<PlayOutcome> {
+pub fn play_stream(
+    chunks: Receiver<Vec<f32>>,
+    sample_rate: u32,
+    volume: f32,
+    cancel: Arc<AtomicBool>,
+    opened: std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<PlayOutcome> {
     let rate = NonZero::new(sample_rate).context("sample rate is zero")?;
     let mono = NonZero::new(1u16).unwrap();
     // Wait for the first piece before opening the audio device, so a request
@@ -195,7 +201,16 @@ pub fn play_stream(chunks: Receiver<Vec<f32>>, sample_rate: u32, volume: f32, ca
             Err(RecvTimeoutError::Disconnected) => return Ok(PlayOutcome::Finished),
         }
     };
-    let mut sink = rodio::DeviceSinkBuilder::open_default_sink().context("no audio output device")?;
+    let mut sink = match rodio::DeviceSinkBuilder::open_default_sink() {
+        Ok(s) => {
+            let _ = opened.send(Ok(()));
+            s
+        }
+        Err(e) => {
+            let _ = opened.send(Err(format!("could not open the Mac's audio output: {e}")));
+            return Err(anyhow::anyhow!("no audio output device: {e}"));
+        }
+    };
     sink.log_on_drop(false);
     let player = rodio::Player::connect_new(sink.mixer());
     player.set_volume(volume.clamp(0.0, 2.0));

@@ -119,6 +119,7 @@ fn preview(text: &str) -> String {
 
 pub struct Speaking {
     first: mpsc::Receiver<Result<(), String>>,
+    opened: mpsc::Receiver<Result<(), String>>,
     synth: JoinHandle<Result<SynthStats>>,
     play: JoinHandle<Result<PlayOutcome>>,
 }
@@ -133,6 +134,7 @@ pub fn start(registry: Arc<Registry>, choice: Choice, text: String, speed: f32, 
     // Synthesis stays at most a few pieces ahead of playback.
     let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(3);
     let (first_tx, first) = mpsc::channel();
+    let (opened_tx, opened) = mpsc::channel();
     let sample_rate = choice.model.info().sample_rate;
     let cancel = guard.cancel.clone();
 
@@ -157,20 +159,27 @@ pub fn start(registry: Arc<Registry>, choice: Choice, text: String, speed: f32, 
         }
     });
     let play = std::thread::spawn(move || {
-        let r = audio::play_stream(rx, sample_rate, volume, cancel);
+        let r = audio::play_stream(rx, sample_rate, volume, cancel, opened_tx);
         drop(guard);
         r
     });
-    Speaking { first, synth, play }
+    Speaking { first, opened, synth, play }
 }
 
 impl Speaking {
-    /// Wait until the first sentence is ready, which is when bad requests fail.
-    pub fn started(&self) -> Result<()> {
+    /// Wait until sound is coming out: the first sentence is made and the
+    /// speaker is open. Returns false if it was stopped before that. Bad
+    /// requests and a missing audio device fail here.
+    pub fn started(&self) -> Result<bool> {
         match self.first.recv() {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(anyhow!(e)),
+            Err(_) => return Ok(false),
+        }
+        match self.opened.recv() {
+            Ok(Ok(())) => Ok(true),
             Ok(Err(e)) => Err(anyhow!(e)),
-            Err(_) => Err(anyhow!("speech stopped before it started")),
+            Err(_) => Ok(false), // stopped before the speaker opened
         }
     }
 
