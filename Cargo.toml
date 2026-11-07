@@ -1,0 +1,40 @@
+[package]
+name = "text-to-voice-local-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "One small binary that finds the text-to-speech models already on your Mac and lets any app use them through MCP."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/shreyashguptas/text-to-voice-local-mcp"
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "text-to-voice-local-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+# espeak-ng, built from source and linked in. Reads words the main dictionary
+# does not know, and every non-English language.
+espeak-rs = "0.1.9"
+# The grapheme-to-phoneme engine Kokoro was trained against (misaki 0.9.4),
+# with its dictionaries embedded in the binary.
+misaki-rs = "0.8.0"
+# ONNX Runtime, statically linked: no Python, no shared libraries to install.
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-24"] }
+rmcp = { version = "3.9.0", features = ["server", "macros", "transport-io"] }
+rodio = { version = "0.23", default-features = false, features = ["playback"] }
+schemars = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "sync", "time"] }
+zip = { version = "9.4.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Stripped with /usr/bin/strip by install.sh (rustup's objcopy is not always present).
+strip = false
